@@ -999,6 +999,7 @@ bridge_apply_settings(struct bridge_state *bst, struct blob_attr **tb)
 
 	/* defaults */
 	cfg->stp = false;
+	cfg->vlan_filtering = false;
 	cfg->forward_delay = 2;
 	cfg->robustness = 2;
 	cfg->igmp_snoop = false;
@@ -1013,6 +1014,9 @@ bridge_apply_settings(struct bridge_state *bst, struct blob_attr **tb)
 
 	if ((cur = tb[BRIDGE_ATTR_STP]))
 		cfg->stp = blobmsg_get_bool(cur);
+
+	if ((cur = tb[BRIDGE_ATTR_VLAN_FILTERING]))
+		cfg->vlan_filtering = blobmsg_get_bool(cur);
 
 	if ((cur = tb[BRIDGE_ATTR_FORWARD_DELAY]))
 		cfg->forward_delay = blobmsg_get_u32(cur);
