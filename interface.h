@@ -105,7 +105,7 @@ struct interface {
 	struct vlist_node node;
 	struct list_head hotplug_list;
 	enum interface_event hotplug_ev;
-
+	enum interface_event last_ev;
 	const char *name;
 	const char *device;
 	char *jail;
@@ -153,6 +153,7 @@ struct interface {
 	struct vlist_tree host_neighbors;
 
 	int metric;
+	int mtu;
 	int dns_metric;
 	unsigned int ip4table;
 	unsigned int ip6table;

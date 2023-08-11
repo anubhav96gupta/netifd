@@ -1223,6 +1223,9 @@ static void system_bridge_conf_multicast(struct device *bridge,
 	system_set_dev_sysctl("/sys/devices/virtual/net/%s/bridge/multicast_querier",
 		bridge->ifname, cfg->multicast_querier ? "1" : "0");
 
+	system_set_dev_sysctl("/sys/devices/virtual/net/%s/bridge/vlan_filtering",
+		bridge->ifname, cfg->vlan_filtering ? "1" : "0");
+
 	snprintf(buf, buf_len, "%i", cfg->hash_max);
 	system_set_dev_sysctl("/sys/devices/virtual/net/%s/bridge/hash_max",
 		bridge->ifname, buf);
@@ -1259,7 +1262,7 @@ int system_bridge_addbr(struct device *bridge, struct bridge_config *cfg)
 {
 	char buf[64];
 
-	if (ioctl(sock_ioctl, SIOCBRADDBR, bridge->ifname) < 0)
+	if (ioctl(sock_ioctl, SIOCBRADDBR, bridge->ifname) < 0 && errno != EEXIST)
 		return -1;
 
 	system_bridge_set_stp_state(bridge, cfg->stp ? "1" : "0");
@@ -1704,6 +1707,38 @@ system_if_get_settings(struct device *dev, struct device_settings *s)
 	}
 }
 
+static void
+system_if_set_rps_xps_val(const char *path, int val)
+{
+	char val_buf[8];
+	glob_t gl;
+	int i;
+
+	if (glob(path, 0, NULL, &gl))
+		return;
+
+	snprintf(val_buf, sizeof(val_buf), "%x", val);
+	for (i = 0; i < gl.gl_pathc; i++)
+		system_set_sysctl(gl.gl_pathv[i], val_buf);
+}
+
+static void
+system_if_apply_rps_xps(struct device *dev, struct device_settings *s)
+{
+	long n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	int val;
+
+	if (n_cpus < 2)
+		return;
+
+	val = (1 << n_cpus) - 1;
+	snprintf(dev_buf, sizeof(dev_buf), "/sys/class/net/%s/queues/*/rps_cpus", dev->ifname);
+	system_if_set_rps_xps_val(dev_buf, s->rps ? val : 0);
+
+	snprintf(dev_buf, sizeof(dev_buf), "/sys/class/net/%s/queues/*/xps_cpus", dev->ifname);
+	system_if_set_rps_xps_val(dev_buf, s->xps ? val : 0);
+}
+
 void
 system_if_apply_settings(struct device *dev, struct device_settings *s, unsigned int apply_mask)
 {
@@ -1800,6 +1835,8 @@ system_if_apply_settings(struct device *dev, struct device_settings *s, unsigned
 		system_set_drop_unsolicited_na(dev, s->drop_unsolicited_na ? "1" : "0");
 	if (apply_mask & DEV_OPT_ARP_ACCEPT)
 		system_set_arp_accept(dev, s->arp_accept ? "1" : "0");
+
+	system_if_apply_rps_xps(dev, s);
 }
 
 int system_if_up(struct device *dev)
@@ -2417,7 +2454,7 @@ static int system_rt(struct device *dev, struct device_route *route, int cmd)
 	struct rtmsg rtm = {
 		.rtm_family = (alen == 4) ? AF_INET : AF_INET6,
 		.rtm_dst_len = route->mask,
-		.rtm_src_len = route->sourcemask,
+		.rtm_src_len = (alen == 4) ? route->sourcemask : 0,
 		.rtm_table = (table < 256) ? table : RT_TABLE_UNSPEC,
 		.rtm_protocol = (route->flags & DEVROUTE_PROTO) ? route->proto : RTPROT_STATIC,
 		.rtm_scope = RT_SCOPE_NOWHERE,
@@ -2427,7 +2464,7 @@ static int system_rt(struct device *dev, struct device_route *route, int cmd)
 	struct nl_msg *msg;
 
 	if (cmd == RTM_NEWROUTE) {
-		flags |= NLM_F_CREATE | NLM_F_REPLACE;
+		flags |= NLM_F_CREATE;
 
 		if (!dev) { /* Add null-route */
 			rtm.rtm_scope = RT_SCOPE_UNIVERSE;
@@ -2468,10 +2505,7 @@ static int system_rt(struct device *dev, struct device_route *route, int cmd)
 		nla_put(msg, RTA_DST, alen, &route->addr);
 
 	if (route->sourcemask) {
-		if (rtm.rtm_family == AF_INET)
-			nla_put(msg, RTA_PREFSRC, alen, &route->source);
-		else
-			nla_put(msg, RTA_SRC, alen, &route->source);
+		nla_put(msg, RTA_PREFSRC, alen, &route->source);
 	}
 
 	if (route->metric > 0)

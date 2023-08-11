@@ -7,7 +7,7 @@ IF(NOT ${CMAKE_VERSION} LESS 3.0)
   check_c_compiler_flag(-Wimplicit-fallthrough HAS_IMPLICIT_FALLTHROUGH)
 ENDIF()
 
-ADD_DEFINITIONS(-Os -Wall -Werror --std=gnu99 -Wmissing-declarations -Wno-unknown-warning-option -Wno-format-truncation)
+ADD_DEFINITIONS(-Os --std=gnu99 -Wmissing-declarations -Wno-unknown-warning-option -Wno-format-truncation)
 
 IF(HAS_IMPLICIT_FALLTHROUGH)
   ADD_DEFINITIONS(-Wimplicit-fallthrough)
@@ -19,7 +19,7 @@ SET(SOURCES
 	main.c utils.c system.c tunnel.c handler.c
 	interface.c interface-ip.c interface-event.c
 	iprule.c proto.c proto-static.c proto-shell.c
-	config.c device.c bridge.c veth.c vlan.c alias.c
+	config.c device.c bridge.c bond.c veth.c vlan.c alias.c
 	macvlan.c ubus.c vlandev.c wireless.c
 	extdev.c)
 
@@ -27,18 +27,13 @@ SET(SOURCES
 SET(LIBS
 	ubox ubus uci json-c blobmsg_json)
 
-IF (NOT DEFINED LIBNL_LIBS)
-	include(FindPkgConfig)
-	pkg_search_module(LIBNL libnl-3.0 libnl-3 libnl nl-3 nl)
-	IF (LIBNL_FOUND)
-		include_directories(${LIBNL_INCLUDE_DIRS})
-		SET(LIBNL_LIBS ${LIBNL_LIBRARIES})
-	ENDIF()
-ENDIF()
+INCLUDE(FindPkgConfig)
+PKG_SEARCH_MODULE(LIBNL libnl-3.0 linl-3 linl nl-3 nl)
+INCLUDE_DIRECTORIES(${LIBNL_INCLUDE_DIRS})
 
 IF("${CMAKE_SYSTEM_NAME}" MATCHES "Linux" AND NOT DUMMY_MODE)
 	SET(SOURCES ${SOURCES} system-linux.c)
-	SET(LIBS ${LIBS} ${LIBNL_LIBS})
+	SET(LIBS ${LIBS} ${LIBNL_LIBRARIES})
 ELSE()
 	ADD_DEFINITIONS(-DDUMMY_MODE=1)
 	SET(SOURCES ${SOURCES} system-dummy.c)

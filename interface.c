@@ -42,6 +42,7 @@ enum {
 	IFACE_ATTR_DNS_SEARCH,
 	IFACE_ATTR_DNS_METRIC,
 	IFACE_ATTR_METRIC,
+	IFACE_ATTR_MTU,
 	IFACE_ATTR_INTERFACE,
 	IFACE_ATTR_IP6ASSIGN,
 	IFACE_ATTR_IP6HINT,
@@ -65,6 +66,7 @@ static const struct blobmsg_policy iface_attrs[IFACE_ATTR_MAX] = {
 	[IFACE_ATTR_DEFAULTROUTE] = { .name = "defaultroute", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_PEERDNS] = { .name = "peerdns", .type = BLOBMSG_TYPE_BOOL },
 	[IFACE_ATTR_METRIC] = { .name = "metric", .type = BLOBMSG_TYPE_INT32 },
+	[IFACE_ATTR_MTU] = { .name = "mtu", .type = BLOBMSG_TYPE_INT32 },
 	[IFACE_ATTR_DNS] = { .name = "dns", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
 	[IFACE_ATTR_DNS_METRIC] = { .name = "dns_metric", .type = BLOBMSG_TYPE_INT32 },
@@ -248,6 +250,8 @@ interface_event(struct interface *iface, enum interface_event ev)
 	struct interface_user *dep, *tmp;
 	struct device *adev = NULL;
 
+	iface->last_ev = ev;
+
 	list_for_each_entry_safe(dep, tmp, &iface->users, list)
 		dep->cb(dep, iface, ev);
 
@@ -273,7 +277,6 @@ interface_flush_state(struct interface *iface)
 {
 	if (iface->l3_dev.dev)
 		device_release(&iface->l3_dev);
-	interface_data_flush(iface);
 }
 
 static void
@@ -286,6 +289,7 @@ mark_interface_down(struct interface *iface)
 
 	iface->link_up_event = false;
 	iface->state = IFS_DOWN;
+	netifd_ubus_interface_state_event(iface);
 	switch (state) {
 	case IFS_UP:
 	case IFS_TEARDOWN:
@@ -302,6 +306,7 @@ mark_interface_down(struct interface *iface)
 	interface_ip_flush(&iface->proto_ip);
 	interface_flush_state(iface);
 	system_flush_routes();
+	netifd_ubus_interface_ip_event(iface);
 }
 
 static inline void
@@ -318,6 +323,7 @@ __interface_set_down(struct interface *iface, bool force)
 	case IFS_UP:
 	case IFS_SETUP:
 		iface->state = IFS_TEARDOWN;
+		netifd_ubus_interface_state_event(iface);
 		if (iface->dynamic)
 			__set_config_state(iface, IFC_REMOVE);
 
@@ -344,9 +350,13 @@ __interface_set_up(struct interface *iface)
 {
 	int ret;
 
+	if (iface->main_dev.dev && !iface->main_dev.claimed)
+		return -1;
+
 	netifd_log_message(L_NOTICE, "Interface '%s' is setting up now\n", iface->name);
 
 	iface->state = IFS_SETUP;
+	netifd_ubus_interface_state_event(iface);
 	ret = interface_proto_event(iface->proto, PROTO_CMD_SETUP, false);
 	if (ret)
 		mark_interface_down(iface);
@@ -368,6 +378,7 @@ interface_check_state(struct interface *iface)
 				__set_config_state(iface, IFC_REMOVE);
 
 			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
+			netifd_ubus_interface_state_event(iface);
 		}
 		break;
 	case IFS_DOWN:
@@ -666,6 +677,7 @@ interface_cleanup_state(struct interface *iface)
 	interface_set_available(iface, false);
 
 	interface_flush_state(iface);
+	interface_data_flush(iface);
 	interface_clear_errors(iface);
 	interface_set_proto_state(iface, NULL);
 
@@ -695,6 +707,7 @@ interface_cleanup(struct interface *iface)
 static void
 interface_do_free(struct interface *iface)
 {
+	interface_free_assignments(iface);
 	interface_event(iface, IFEV_FREE);
 	interface_cleanup(iface);
 	free(iface->config);
@@ -757,21 +770,29 @@ interface_proto_event_cb(struct interface_proto_state *state, enum interface_pro
 		interface_ip_set_enabled(&iface->proto_ip, true);
 		system_flush_routes();
 		iface->state = IFS_UP;
+		netifd_ubus_interface_state_event(iface);
+		netifd_ubus_interface_ip_event(iface);
 		iface->start_time = system_get_rtime();
 		interface_event(iface, IFEV_UP);
 		netifd_log_message(L_NOTICE, "Interface '%s' is now up\n", iface->name);
+		netifd_ubus_actiond_trigger_event();
 		break;
 	case IFPEV_DOWN:
-		if (iface->state == IFS_DOWN)
+		if (iface->state == IFS_DOWN) {
+			netifd_ubus_actiond_trigger_event();
 			return;
+		}
 
 		netifd_log_message(L_NOTICE, "Interface '%s' is now down\n", iface->name);
+		enum interface_state const old_state = iface->state;
 		mark_interface_down(iface);
 		if (iface->main_dev.dev)
 			device_release(&iface->main_dev);
 		if (iface->l3_dev.dev)
 			device_remove_user(&iface->l3_dev);
 		interface_handle_config_change(iface);
+		if (old_state != IFS_SETUP)
+			netifd_ubus_actiond_trigger_event();
 		break;
 	case IFPEV_LINK_LOST:
 		if (iface->state != IFS_UP)
@@ -780,6 +801,8 @@ interface_proto_event_cb(struct interface_proto_state *state, enum interface_pro
 		netifd_log_message(L_NOTICE, "Interface '%s' has lost the connection\n", iface->name);
 		mark_interface_down(iface);
 		iface->state = IFS_SETUP;
+		netifd_ubus_interface_state_event(iface);
+		netifd_ubus_actiond_trigger_event();
 		break;
 	default:
 		return;
@@ -795,6 +818,7 @@ void interface_set_proto_state(struct interface *iface, struct interface_proto_s
 		iface->proto = NULL;
 	}
 	iface->state = IFS_DOWN;
+	netifd_ubus_interface_state_event(iface);
 	iface->proto = state;
 	if (!state)
 		return;
@@ -856,6 +880,9 @@ interface_alloc(const char *name, struct blob_attr *config, bool dynamic)
 
 	if ((cur = tb[IFACE_ATTR_METRIC]))
 		iface->metric = blobmsg_get_u32(cur);
+
+	if ((cur = tb[IFACE_ATTR_MTU]))
+		iface->mtu = blobmsg_get_u32(cur);
 
 	if ((cur = tb[IFACE_ATTR_IP6ASSIGN]))
 		iface->assignment_length = blobmsg_get_u32(cur);
@@ -1007,6 +1034,7 @@ interface_set_l3_dev(struct interface *iface, struct device *dev)
 		interface_ip_set_enabled(&iface->config_ip, enabled);
 		interface_ip_set_enabled(&iface->proto_ip, enabled);
 	}
+	netifd_ubus_interface_ip_event(iface);
 }
 
 static void
@@ -1299,6 +1327,7 @@ interface_update_start(struct interface *iface, const bool keep_old)
 void
 interface_update_complete(struct interface *iface)
 {
+	iface->proto_ip.iface->mtu = iface->mtu;
 	interface_ip_update_complete(&iface->proto_ip);
 }
 
@@ -1413,6 +1442,7 @@ interface_change_config(struct interface *if_old, struct interface *if_new)
 	interface_replace_dns(&if_old->config_ip, &if_new->config_ip);
 
 	UPDATE(metric, reload_ip);
+	UPDATE(mtu, reload_ip);
 	UPDATE(proto_ip.no_defaultroute, reload_ip);
 	UPDATE(ip4table, reload_ip);
 	UPDATE(ip6table, reload_ip);
@@ -1436,6 +1466,7 @@ interface_change_config(struct interface *if_old, struct interface *if_new)
 		interface_ip_set_enabled(&if_old->proto_ip, false);
 		interface_ip_set_enabled(&if_old->proto_ip, proto_ip_enabled);
 		interface_ip_set_enabled(&if_old->config_ip, config_ip_enabled);
+		netifd_ubus_interface_ip_event(if_old);
 	}
 
 	if (update_prefix_delegation)
@@ -1460,6 +1491,9 @@ interface_update(struct vlist_tree *tree, struct vlist_node *node_new,
 	struct interface *if_new = container_of(node_new, struct interface, node);
 
 	if (node_old && node_new) {
+		if (if_old->config_state == IFC_REMOVE) {
+			if_old->config_state = IFC_NORMAL;
+		}
 		D(INTERFACE, "Update interface '%s'\n", if_new->name);
 		interface_change_config(if_old, if_new);
 	} else if (node_old) {
@@ -1470,6 +1504,7 @@ interface_update(struct vlist_tree *tree, struct vlist_node *node_new,
 		interface_event(if_new, IFEV_CREATE);
 		proto_init_interface(if_new, if_new->config);
 		interface_claim_device(if_new);
+		interface_refresh_assignments(true);
 		netifd_ubus_add_interface(if_new);
 	}
 }

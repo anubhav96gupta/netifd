@@ -47,6 +47,7 @@ netifd_handle_reload(struct ubus_context *ctx, struct ubus_object *obj,
 	if (netifd_reload())
 		return UBUS_STATUS_NOT_FOUND;
 
+	netifd_ubus_actiond_trigger_event();
 	return UBUS_STATUS_OK;
 }
 
@@ -114,11 +115,13 @@ netifd_get_proto_handlers(struct ubus_context *ctx, struct ubus_object *obj,
 
 enum {
 	DI_NAME,
+	DI_MTU,
 	__DI_MAX
 };
 
 static const struct blobmsg_policy dynamic_policy[__DI_MAX] = {
 	[DI_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
+	[DI_MTU] = { .name = "mtu", .type = BLOBMSG_TYPE_INT32 },
 };
 
 static int
@@ -578,7 +581,7 @@ interface_ip_dump_neighbor_list(struct interface_ip_settings *ip, bool enabled)
 }
 
 static void
-interface_ip_dump_route_list(struct interface_ip_settings *ip, bool enabled)
+interface_ip_dump_route_list(struct interface_ip_settings *ip, bool v6, bool enabled)
 {
 	struct device_route *route;
 	int buflen = 128;
@@ -598,6 +601,9 @@ interface_ip_dump_route_list(struct interface_ip_settings *ip, bool enabled)
 			af = AF_INET;
 		else
 			af = AF_INET6;
+
+		if (af != (v6 ? AF_INET6 : AF_INET))
+			continue;
 
 		r = blobmsg_open_table(&b, NULL);
 
@@ -715,9 +721,15 @@ interface_ip_dump_prefix_assignment_list(struct interface *iface)
 
 			a = blobmsg_open_table(&b, NULL);
 
-			buf = blobmsg_alloc_string_buffer(&b, "address", buflen);
+			buf = blobmsg_alloc_string_buffer(&b, "prefix", buflen);
 			inet_ntop(AF_INET6, &addr, buf, buflen);
 			blobmsg_add_string_buffer(&b);
+
+			if (!IN6_IS_ADDR_UNSPECIFIED(&assign->addr)) {
+				buf = blobmsg_alloc_string_buffer(&b, "address", buflen);
+				inet_ntop(AF_INET6, &assign->addr, buf, buflen);
+				blobmsg_add_string_buffer(&b);
+			}
 
 			blobmsg_add_u32(&b, "mask", assign->length);
 
@@ -831,6 +843,7 @@ netifd_dump_status(struct interface *iface)
 		if (iface->ip6table)
 			blobmsg_add_u32(&b, "ip6table", iface->ip6table);
 		blobmsg_add_u32(&b, "metric", iface->metric);
+		blobmsg_add_u32(&b, "mtu", iface->mtu);
 		blobmsg_add_u32(&b, "dns_metric", iface->dns_metric);
 		blobmsg_add_u8(&b, "delegation", !iface->proto_ip.no_delegation);
 		if (iface->assignment_weight)
@@ -850,9 +863,13 @@ netifd_dump_status(struct interface *iface)
 		a = blobmsg_open_array(&b, "ipv6-prefix-assignment");
 		interface_ip_dump_prefix_assignment_list(iface);
 		blobmsg_close_array(&b, a);
-		a = blobmsg_open_array(&b, "route");
-		interface_ip_dump_route_list(&iface->config_ip, true);
-		interface_ip_dump_route_list(&iface->proto_ip, true);
+		a = blobmsg_open_array(&b, "ipv4-route");
+		interface_ip_dump_route_list(&iface->config_ip, false, true);
+		interface_ip_dump_route_list(&iface->proto_ip, false, true);
+		blobmsg_close_array(&b, a);
+		a = blobmsg_open_array(&b, "ipv6-route");
+		interface_ip_dump_route_list(&iface->config_ip, true, true);
+		interface_ip_dump_route_list(&iface->proto_ip, true, true);
 		blobmsg_close_array(&b, a);
 		a = blobmsg_open_array(&b, "dns-server");
 		interface_ip_dump_dns_server_list(&iface->config_ip, true);
@@ -876,9 +893,13 @@ netifd_dump_status(struct interface *iface)
 		interface_ip_dump_address_list(&iface->config_ip, true, false);
 		interface_ip_dump_address_list(&iface->proto_ip, true, false);
 		blobmsg_close_array(&b, a);
-		a = blobmsg_open_array(&b, "route");
-		interface_ip_dump_route_list(&iface->config_ip, false);
-		interface_ip_dump_route_list(&iface->proto_ip, false);
+		a = blobmsg_open_array(&b, "ipv4-route");
+		interface_ip_dump_route_list(&iface->config_ip, false, false);
+		interface_ip_dump_route_list(&iface->proto_ip, false, false);
+		blobmsg_close_array(&b, a);
+		a = blobmsg_open_array(&b, "ipv6-route");
+		interface_ip_dump_route_list(&iface->config_ip, true, false);
+		interface_ip_dump_route_list(&iface->proto_ip, true, false);
 		blobmsg_close_array(&b, a);
 		a = blobmsg_open_array(&b, "dns-server");
 		interface_ip_dump_dns_server_list(&iface->config_ip, false);
@@ -1372,6 +1393,39 @@ netifd_ubus_interface_event(struct interface *iface, bool up)
 }
 
 void
+netifd_ubus_interface_state_event(struct interface *iface)
+{
+	const char *state;
+	struct interface *real_iface;
+
+	/* make sure we have the real iface and not some bogus dynamic one */
+	real_iface = vlist_find(&interfaces, iface->name, real_iface, node);
+	if (real_iface)
+		iface = real_iface;
+
+	blob_buf_init(&b, 0);
+	switch (iface->state) {
+		case IFS_SETUP:    state = "setup";    break;
+		case IFS_UP:       state = "up";       break;
+		case IFS_TEARDOWN: state = "teardown"; break;
+		case IFS_DOWN:     state = "down";     break;
+		default:           state = "unknown";  break;
+	}
+	blobmsg_add_string(&b, "state", state);
+	blobmsg_add_string(&b, "interface", iface->name);
+	ubus_send_event(ubus_ctx, "network.interface", b.head);
+}
+
+void
+netifd_ubus_interface_ip_event(struct interface *iface)
+{
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "action", "ip");
+	blobmsg_add_string(&b, "interface", iface->name);
+	ubus_send_event(ubus_ctx, "network.interface", b.head);
+}
+
+void
 netifd_ubus_interface_notify(struct interface *iface, bool up)
 {
 	const char *event = (up) ? "interface.update" : "interface.down";
@@ -1410,4 +1464,30 @@ netifd_ubus_remove_interface(struct interface *iface)
 
 	ubus_remove_object(ubus_ctx, &iface->ubus);
 	free((void *) iface->ubus.name);
+}
+
+static struct uloop_timeout trigger_timeout;
+
+static void
+netifd_trigger_cb(struct uloop_timeout *t)
+{
+	int ret;
+	static uint32_t ubus_id;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "type", "event");
+	blobmsg_add_string(&b, "val", "netifd");
+	ret = ubus_lookup_id(ubus_ctx, "actiond", &ubus_id);
+	if (ret == UBUS_STATUS_OK)
+		ubus_invoke(ubus_ctx, ubus_id, "trigger", b.head, NULL, NULL, 2000);
+}
+
+void
+netifd_ubus_actiond_trigger_event()
+{
+	if (!trigger_timeout.pending) {
+		/* Delay reload status to capture many events triggered close together */
+		trigger_timeout.cb = netifd_trigger_cb;
+		uloop_timeout_set(&trigger_timeout, 1000);
+	}
 }
